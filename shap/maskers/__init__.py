@@ -1,5 +1,5 @@
 from ._composite import Composite
-from ._dishap import ConditionalGeneratorMasker
+from ._dishap import ConditionalGeneratorMasker, DiffusionImputer
 from ._fixed import Fixed
 from ._fixed_composite import FixedComposite
 from ._image import Image
@@ -11,6 +11,7 @@ from ._text import Text
 __all__ = [
     "Composite",
     "ConditionalGeneratorMasker",
+    "DiffusionImputer",
     "Fixed",
     "FixedComposite",
     "Image",
