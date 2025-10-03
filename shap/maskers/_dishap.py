@@ -8,7 +8,7 @@ observed features of the instance under explanation.
 from __future__ import annotations
 
 import inspect
-from typing import Iterable, Optional, Sequence, Union
+from typing import Any, Callable, Iterable, Optional, Sequence, Union, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,15 @@ from sklearn.preprocessing import QuantileTransformer
 from sklearn.utils import check_random_state
 
 from ._masker import Masker
+
+
+try:  # pragma: no cover - torch is an optional dependency for diffusion models
+    import torch
+except ImportError:  # pragma: no cover - gracefully handle environments without torch
+    torch = None
+
+if TYPE_CHECKING:  # pragma: no cover - used only for static typing
+    from torch import Generator as TorchGenerator, Tensor as TorchTensor
 
 
 class BaseConditionalGenerator:
@@ -111,6 +120,284 @@ class BaseConditionalGenerator:
     def _check_is_fitted(self):
         if not self._fitted:
             raise RuntimeError("The generator is not fitted yet. Call 'fit' with appropriate data before sampling.")
+
+
+class DiffusionImputer(BaseConditionalGenerator):
+    """Conditional generator that delegates to a diffusion style imputer.
+
+    Parameters
+    ----------
+    backbone : object
+        Object implementing a :meth:`sample_conditional` method with signature
+        ``(x, mask, n_samples, generator=None)`` and optionally ``fit``.
+    device : str or torch.device, optional
+        Device on which the underlying backbone should run. Defaults to CPU
+        when not provided.
+    torch_dtype : torch.dtype or str, optional
+        Target dtype for tensors passed to the backbone. If ``None`` a
+        floating point dtype (``torch.float32``) is used.
+    ensure_observed : bool, default True
+        If ``True``, enforce that observed features in sampled batches match
+        the conditioning vector ``x`` exactly. This mirrors the behaviour of
+        standard DI-SHAP generators.
+    """
+
+    def __init__(
+        self,
+        backbone: Any,
+        *,
+        device: Optional[Any] = None,
+        torch_dtype: Optional[Any] = None,
+        ensure_observed: bool = True,
+        random_state: Optional[Union[int, np.random.RandomState]] = None,
+    ):
+        if torch is None:  # pragma: no cover - executed only when torch is missing
+            raise ImportError(
+                "DiffusionImputer requires the optional dependency 'torch'. "
+                "Install PyTorch to enable diffusion-based maskers."
+            )
+        super().__init__(random_state=random_state)
+        self.backbone = backbone
+        self.device = device
+        self.torch_dtype = torch_dtype
+        self.ensure_observed = bool(ensure_observed)
+
+        self._torch_device: Optional[torch.device] = None
+        self._torch_dtype: Optional[torch.dtype] = None
+        self._torch_generator: Optional["TorchGenerator"] = None
+        self._backbone_fitted: bool = False
+        self._eval_called: bool = False
+
+    # ------------------------------------------------------------------
+    # BaseConditionalGenerator hooks
+    # ------------------------------------------------------------------
+    def _fit(self, data: np.ndarray):
+        self._torch_device = self._resolve_device()
+        self._torch_dtype = self._resolve_dtype(data)
+        tensor_data = self._to_model_space(data)
+
+        if hasattr(self.backbone, "fit") and callable(self.backbone.fit):
+            try:
+                self.backbone.fit(tensor_data)
+            except TypeError:
+                try:
+                    # Some backbones expect numpy data. Fall back to the raw array.
+                    self.backbone.fit(data)
+                except TypeError:
+                    self.backbone.fit()
+
+        self._backbone_fitted = True
+
+    def _sample(self, x: np.ndarray, mask: np.ndarray, n_samples: int) -> np.ndarray:
+        self._ensure_torch_available()
+        self._check_backbone_ready()
+
+        x_tensor = self._prepare_example_tensor(x)
+        mask_tensor = torch.as_tensor(mask, dtype=torch.bool, device=self._torch_device)
+        mask_tensor = mask_tensor.unsqueeze(0)
+
+        torch_generator = self._get_torch_generator()
+        sampler = getattr(self.backbone, "sample_conditional")
+        try:
+            samples_tensor = sampler(
+                x_tensor,
+                mask_tensor,
+                int(n_samples),
+                generator=torch_generator,
+            )
+        except TypeError:
+            samples_tensor = sampler(
+                x_tensor,
+                mask_tensor,
+                int(n_samples),
+            )
+        samples_tensor = self._ensure_tensor_output(samples_tensor, n_samples)
+        samples_array = self._from_model_space(samples_tensor)
+
+        if self.ensure_observed:
+            observed_idx = np.where(mask)[0]
+            if observed_idx.size:
+                samples_array[:, observed_idx] = x[observed_idx]
+
+        return samples_array
+
+    # ------------------------------------------------------------------
+    # Helper utilities
+    # ------------------------------------------------------------------
+    def _ensure_torch_available(self):
+        if torch is None:  # pragma: no cover - safeguard for type checkers
+            raise ImportError("DiffusionImputer requires PyTorch to operate.")
+
+    def _resolve_device(self) -> "torch.device":
+        self._ensure_torch_available()
+        if self.device is None:
+            return torch.device("cpu")
+        return torch.device(self.device)
+
+    def _resolve_dtype(self, data: np.ndarray) -> "torch.dtype":
+        self._ensure_torch_available()
+        if self.torch_dtype is not None:
+            if isinstance(self.torch_dtype, str):
+                try:
+                    return getattr(torch, self.torch_dtype)
+                except AttributeError as exc:  # pragma: no cover - invalid dtype provided
+                    raise ValueError(f"Unknown torch dtype '{self.torch_dtype}'.") from exc
+            return self.torch_dtype
+
+        if data.dtype == np.float64:
+            return torch.float64
+        return torch.float32
+
+    def _to_model_space(self, array: Union[np.ndarray, Sequence[float]]) -> "TorchTensor":
+        tensor = torch.as_tensor(array, dtype=self._torch_dtype, device=self._torch_device)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    def _from_model_space(self, tensor: "TorchTensor") -> np.ndarray:
+        if tensor.ndim == 3 and tensor.shape[1] == 1:
+            tensor = tensor.squeeze(1)
+        tensor = tensor.detach().to("cpu")
+        array = tensor.numpy()
+        return array.astype(self._dtype, copy=False) if self._dtype is not None else array
+
+    def _prepare_example_tensor(self, x: np.ndarray) -> "TorchTensor":
+        tensor = torch.as_tensor(x, dtype=self._torch_dtype, device=self._torch_device)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        return tensor
+
+    def _ensure_tensor_output(self, output: Any, n_samples: int) -> "TorchTensor":
+        if isinstance(output, (list, tuple)):
+            if not output:  # pragma: no cover - defensive
+                raise ValueError("Backbone returned an empty output sequence.")
+            output = output[0]
+
+        tensor = torch.as_tensor(output, dtype=self._torch_dtype, device=self._torch_device)
+        if tensor.ndim == 1:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim == 3 and tensor.shape[1] == 1:
+            tensor = tensor.squeeze(1)
+
+        if tensor.shape[0] != n_samples:
+            # Broadcast a single sample if provided, otherwise raise.
+            if tensor.shape[0] == 1:
+                tensor = tensor.repeat(n_samples, 1)
+            else:
+                raise ValueError(
+                    "Backbone returned samples with an unexpected leading dimension. "
+                    f"Expected {n_samples}, received {tensor.shape[0]}."
+                )
+        if tensor.shape[1] != int(self._n_features or tensor.shape[1]):
+            raise ValueError(
+                "Backbone returned samples with incompatible feature dimension. "
+                f"Expected {self._n_features}, received {tensor.shape[1]}."
+            )
+        return tensor
+
+    def _get_torch_generator(self) -> "TorchGenerator":
+        self._ensure_torch_available()
+        if self._torch_generator is None:
+            self._torch_generator = torch.Generator(device=self._torch_device)
+        seed = int(self.random_state.randint(np.iinfo(np.int32).max))
+        self._torch_generator.manual_seed(seed)
+        return self._torch_generator
+
+    def _check_backbone_ready(self):
+        if hasattr(self.backbone, "eval") and not self._eval_called:
+            # If the model differentiates between train/eval we assume eval mode.
+            try:
+                self.backbone.eval()
+            except Exception:  # pragma: no cover - some models may not support eval
+                pass
+            self._eval_called = True
+
+
+class GenericTorchDenoiserAdapter:
+    """Adapter that exposes a uniform ``sample_conditional`` interface."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        sampler: Optional[Callable[..., Any]] = None,
+        fitter: Optional[Callable[[Any, Any], Any]] = None,
+    ):
+        self.model = model
+        self._sampler = sampler
+        self._fitter = fitter
+
+    def fit(self, data: Any):
+        if self._fitter is not None:
+            self._fitter(self.model, data)
+            return self
+        if hasattr(self.model, "fit") and callable(self.model.fit):
+            self.model.fit(data)
+        return self
+
+    def sample_conditional(
+        self,
+        x: Any,
+        mask: Any,
+        n_samples: int,
+        *,
+        generator: Optional[Any] = None,
+    ) -> Any:
+        sampler = self._resolve_sampler()
+        signature = inspect.signature(sampler)
+        kwargs: dict[str, Any] = {}
+        args: list[Any] = []
+
+        param_names = list(signature.parameters)
+        if "x" in signature.parameters:
+            kwargs["x"] = x
+        elif param_names:
+            args.append(x)
+
+        if "mask" in signature.parameters:
+            kwargs["mask"] = mask
+        elif len(args) < len(param_names):
+            args.append(mask)
+
+        if "n_samples" in signature.parameters:
+            kwargs["n_samples"] = n_samples
+        elif len(args) < len(param_names):
+            args.append(n_samples)
+
+        if generator is not None:
+            if "generator" in signature.parameters:
+                kwargs["generator"] = generator
+            elif "torch_generator" in signature.parameters:
+                kwargs["torch_generator"] = generator
+
+        return sampler(*args, **kwargs)
+
+    def _resolve_sampler(self) -> Callable[..., Any]:
+        if self._sampler is not None:
+            return self._sampler
+
+        if hasattr(self.model, "sample_conditional") and callable(self.model.sample_conditional):
+            return self.model.sample_conditional
+        if hasattr(self.model, "sample") and callable(self.model.sample):
+            return self.model.sample
+        raise AttributeError("The wrapped model does not expose a sampling routine.")
+
+
+class TabDDPMAdapter(GenericTorchDenoiserAdapter):
+    """Adapter for TabDDPM style conditional diffusion models."""
+
+    def sample_conditional(
+        self,
+        x: Any,
+        mask: Any,
+        n_samples: int,
+        *,
+        generator: Optional[Any] = None,
+    ) -> Any:
+        if torch is not None:
+            x = torch.as_tensor(x)
+            mask = torch.as_tensor(mask, dtype=torch.bool, device=x.device)
+        return super().sample_conditional(x, mask, n_samples, generator=generator)
 
 
 class GaussianCopulaGenerator(BaseConditionalGenerator):
