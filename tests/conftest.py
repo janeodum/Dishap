@@ -8,13 +8,21 @@ try:
 except ImportError:
     pass
 
-import matplotlib.pyplot as plt
+try:  # pragma: no cover - matplotlib is optional in some environments
+    import matplotlib.pyplot as plt
+except ImportError:  # pragma: no cover - fallback when matplotlib is absent
+    plt = None  # type: ignore[assignment]
 import numpy as np
 import pytest
 
 
 def pytest_addoption(parser):
     parser.addoption("--random-seed", action="store", help="Fix the random seed")
+    parser.addoption(
+        "--mpl",
+        action="store_true",
+        help="Compatibility option when pytest-mpl is not installed.",
+    )
 
 
 @pytest.fixture()
@@ -69,6 +77,10 @@ def global_random_seed():
 @pytest.fixture(autouse=True)
 def mpl_test_cleanup():
     """Run tests in a mpl context manager and close figures after each test."""
+    if plt is None:
+        yield
+        return
+
     plt.switch_backend("Agg")  # Non-interactive backend
     with plt.rc_context():
         yield
